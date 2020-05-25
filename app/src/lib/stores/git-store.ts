@@ -81,13 +81,11 @@ import { formatCommitMessage } from '../format-commit-message'
 import { GitAuthor } from '../../models/git-author'
 import { IGitAccount } from '../../models/git-account'
 import { BaseStore } from './base-store'
-import { enableStashing } from '../feature-flag'
 import { getStashes, getStashedFiles } from '../git/stash'
 import { IStashEntry, StashedChangesLoadStates } from '../../models/stash-entry'
 import { PullRequest } from '../../models/pull-request'
-import { fetchTagsToPushMemoized } from './helpers/fetch-tags-to-push-memoized'
-import { shallowEquals } from '../equality'
 import { StatsStore } from '../stats'
+import { getTagsToPush, storeTagsToPush } from './helpers/tags-to-push-storage'
 
 /** The number of commits to load from history per batch. */
 const CommitBatchSize = 100
@@ -128,7 +126,7 @@ export class GitStore extends BaseStore {
 
   private _aheadBehind: IAheadBehind | null = null
 
-  private _tagsToPush: ReadonlyArray<string> | null = null
+  private _tagsToPush: ReadonlyArray<string> = []
 
   private _defaultRemote: IRemote | null = null
 
@@ -148,6 +146,8 @@ export class GitStore extends BaseStore {
     private readonly statsStore: StatsStore
   ) {
     super()
+
+    this._tagsToPush = getTagsToPush(repository)
   }
 
   private emitNewCommitsLoaded(commits: ReadonlyArray<Commit>) {
@@ -265,7 +265,15 @@ export class GitStore extends BaseStore {
 
   public async refreshTags() {
     const previousTags = this._localTags
-    this._localTags = await getAllTags(this.repository)
+    const newTags = await this.performFailableOperation(() =>
+      getAllTags(this.repository)
+    )
+
+    if (newTags === undefined) {
+      return
+    }
+
+    this._localTags = newTags
 
     if (previousTags !== null) {
       // We don't await for the emition of updates to finish
@@ -324,18 +332,14 @@ export class GitStore extends BaseStore {
     this.storeCommits(commitsToStore, true)
   }
 
-  public async createTag(
-    account: IGitAccount | null,
-    name: string,
-    targetCommitSha: string
-  ) {
+  public async createTag(name: string, targetCommitSha: string) {
     await this.performFailableOperation(async () => {
       await createTag(this.repository, name, targetCommitSha)
     })
 
     await this.refreshTags()
 
-    this.fetchTagsToPush(account)
+    this.addTagToPush(name)
   }
 
   /** The list of ordered SHAs. */
@@ -443,44 +447,18 @@ export class GitStore extends BaseStore {
         .shift() || null
   }
 
-  public async fetchTagsToPush(account: IGitAccount | null) {
-    const currentRemote = this._currentRemote
+  private addTagToPush(tagName: string) {
+    this._tagsToPush = [...this._tagsToPush, tagName]
 
-    if (currentRemote === null) {
-      this._tagsToPush = null
-      return
-    }
+    storeTagsToPush(this.repository, this._tagsToPush)
+    this.emitUpdate()
+  }
 
-    const localTags = this._localTags
-    if (localTags === null) {
-      this._tagsToPush = null
-      return
-    }
+  public clearTagsToPush() {
+    this._tagsToPush = []
 
-    if (this.tip.kind !== TipState.Valid) {
-      this._tagsToPush = null
-      return
-    }
-    const currentBranch = this.tip.branch
-
-    const tagsToPush = await this.performFailableOperation(() =>
-      fetchTagsToPushMemoized(
-        this.repository,
-        account,
-        currentRemote,
-        currentBranch.name,
-        localTags,
-        currentBranch.tip.sha
-      )
-    )
-
-    const previousTagsToPush = this._tagsToPush
-
-    this._tagsToPush = tagsToPush !== undefined ? tagsToPush : null
-
-    if (!shallowEquals(previousTagsToPush, this._tagsToPush)) {
-      this.emitUpdate()
-    }
+    storeTagsToPush(this.repository, this._tagsToPush)
+    this.emitUpdate()
   }
 
   /**
@@ -1095,10 +1073,6 @@ export class GitStore extends BaseStore {
    * Refreshes the list of GitHub Desktop created stash entries for the repository
    */
   public async loadStashEntries(): Promise<void> {
-    if (!enableStashing()) {
-      return
-    }
-
     const map = new Map<string, IStashEntry>()
     const stash = await getStashes(this.repository)
 
@@ -1150,10 +1124,6 @@ export class GitStore extends BaseStore {
    * Updates the latest stash entry with a list of files that it changes
    */
   private async loadFilesForCurrentStashEntry() {
-    if (!enableStashing()) {
-      return
-    }
-
     const stashEntry = this.currentBranchStashEntry
 
     if (
